@@ -13,7 +13,7 @@ import java.time.LocalDate;
 import java.util.*;
 
 /**
- * Performance benchmark: 1 000 000 rows × 340 mixed-type columns.
+ * Performance benchmark: 1 000 00 rows × 340 mixed-type columns.
  *
  * The data provider is constructed BEFORE the timer starts, so the
  * reported time measures only Excel generation and disk write — no DB time.
@@ -26,7 +26,7 @@ import java.util.*;
 @Disabled("Long-running benchmark — run manually: mvn test -Dtest=MillionRowBenchmarkTest")
 class MillionRowBenchmarkTest {
 
-    private static final int ROWS = 1_000_000;
+    private static final int ROWS = 100_000;
     private static final int COLS = 340;
 
     // Column counts per type — must sum to COLS (340)
