@@ -1,0 +1,30 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/${DB_NAME:your_database}
+    username: ${DB_USERNAME:postgres}
+    password: ${DB_PASSWORD:}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout: 30000
+      # Allow long-running export queries to hold a connection
+      max-lifetime: 1800000        # 30 min
+      keepalive-time: 60000
+
+  mvc:
+    async:
+      request-timeout: -1          # -1 = no timeout (required for large file exports)
+
+server:
+  port: 8080
+  servlet:
+    context-path: /
+  # Increase Tomcat's async send-file timeout for large streaming responses
+  tomcat:
+    async-timeout: 0               # 0 = infinite
+
+logging:
+  level:
+    com.example.excelexport: DEBUG
+    org.springframework.jdbc: DEBUG  # shows executed SQL; remove in production
