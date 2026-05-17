@@ -64,4 +64,19 @@ public class ExcelExportConfig {
      */
     @Builder.Default
     private int rowAccessWindowSize = 1_000;
+
+    /**
+     * Maximum data rows per sheet before a new sheet is created automatically.
+     * Set this when the product of (rows × columns) would push uncompressed sheet XML
+     * beyond ~1.8 GB — the safe ceiling below POI's ZIP integer-overflow threshold.
+     *
+     * Rule of thumb: maxRowsPerSheet = floor(1_800_000_000 / (columns × 45))
+     *   e.g. 340 cols → ~117 000 rows per sheet
+     *        60  cols → ~666 000 rows per sheet
+     *
+     * 0 (default) = unlimited / single sheet.
+     * Each continuation sheet is named "SheetName (2)", "SheetName (3)", …
+     */
+    @Builder.Default
+    private int maxRowsPerSheet = 0;
 }

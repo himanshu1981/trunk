@@ -17,7 +17,6 @@ import java.time.LocalDateTime;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Core Excel export service.
@@ -48,9 +47,15 @@ public class ExcelExportService {
     /**
      * Streams an .xlsx file to {@code outputStream}.
      *
-     * @param config       columns, freeze settings, styling options
-     * @param dataProvider source that pushes rows via the ExcelRowWriter callback
-     * @param outputStream destination — typically HttpServletResponse.getOutputStream()
+     * <p>When {@link ExcelExportConfig#getMaxRowsPerSheet()} is set, rows are spread across
+     * multiple sheets automatically.  This is required for wide exports (many columns) where
+     * a single sheet's XML would exceed ~1.8 GB — the safe ceiling before POI's internal
+     * ZIP counter overflows.  Each continuation sheet gets the header row and freeze/filter
+     * applied identically to the first sheet.
+     *
+     * @param config       columns, freeze settings, row-cap, styling options
+     * @param dataProvider source that pushes rows via the {@link ExcelRowWriter} callback
+     * @param outputStream destination — typically {@code HttpServletResponse.getOutputStream()}
      */
     public void exportToStream(ExcelExportConfig config,
                                ExcelDataProvider dataProvider,
@@ -58,96 +63,120 @@ public class ExcelExportService {
 
         int windowSize = config.getRowAccessWindowSize() > 0
                 ? config.getRowAccessWindowSize() : 1_000;
+        int maxPerSheet = config.getMaxRowsPerSheet() > 0
+                ? config.getMaxRowsPerSheet() : Integer.MAX_VALUE;
 
-        log.info("Excel export starting — sheet='{}', freezeCols={}, freezeRows={}, windowSize={}",
+        log.info("Excel export starting — sheet='{}', freezeCols={}, freezeRows={}, " +
+                        "windowSize={}, maxRowsPerSheet={}",
                 config.getSheetName(), config.getFreezeColumnCount(),
-                config.getFreezeRowCount(), windowSize);
+                config.getFreezeRowCount(), windowSize,
+                maxPerSheet == Integer.MAX_VALUE ? "unlimited" : maxPerSheet);
 
-        // SXSSFWorkbook spills rows beyond windowSize to a temp file automatically.
-        // setCompressTempFiles(true) uses GZIP for those temp files, trading CPU for disk.
         try (SXSSFWorkbook workbook = new SXSSFWorkbook(windowSize)) {
             workbook.setCompressTempFiles(true);
 
-            String sheetName = StringUtils.hasText(config.getSheetName())
-                    ? config.getSheetName() : "Sheet1";
-            SXSSFSheet sheet = workbook.createSheet(sheetName);
-            sheet.setDefaultRowHeightInPoints(15);
-
             List<ExcelColumnConfig> columns = config.getColumns();
             int colCount = columns.size();
+            String baseName = StringUtils.hasText(config.getSheetName())
+                    ? config.getSheetName() : "Sheet1";
 
-            // ----------------------------------------------------------------
-            // Pre-create ALL cell styles BEFORE any rows are written.
-            // POI has a hard limit of 64 000 styles per workbook; creating one
-            // per cell would exhaust it instantly for large exports.
-            // ----------------------------------------------------------------
-            CellStyle            headerStyle   = buildHeaderStyle(workbook, config);
+            // Styles are workbook-scoped and shared across all sheets
+            CellStyle              headerStyle = buildHeaderStyle(workbook, config);
             Map<Integer, CellStyle> colStyles  = buildColumnStyles(workbook, columns);
 
             // ----------------------------------------------------------------
-            // Header row (index 0)
+            // Mutable state shared across the lambda — array wrappers allow
+            // capture without requiring effectively-final variables.
             // ----------------------------------------------------------------
-            Row headerRow = sheet.createRow(0);
-            headerRow.setHeightInPoints(22);
-            for (int i = 0; i < colCount; i++) {
-                Cell cell = headerRow.createCell(i);
-                cell.setCellValue(columns.get(i).getHeader());
-                cell.setCellStyle(headerStyle);
-            }
-
-            // ----------------------------------------------------------------
-            // Freeze pane — must be set after the sheet is created but the
-            // position is independent of how many rows have been written.
-            // createFreezePane(colSplit, rowSplit):
-            //   colSplit = first UNfrozen column (0-based)
-            //   rowSplit = first UNfrozen row    (0-based)
-            // ----------------------------------------------------------------
-            int freezeCols = Math.max(config.getFreezeColumnCount(), 0);
-            int freezeRows = config.getFreezeRowCount() > 0 ? config.getFreezeRowCount() : 1;
-            sheet.createFreezePane(freezeCols, freezeRows);
-
-            // ----------------------------------------------------------------
-            // Auto-filter on the header row — spans all columns
-            // ----------------------------------------------------------------
-            sheet.setAutoFilter(new CellRangeAddress(0, 0, 0, colCount - 1));
-
-            // ----------------------------------------------------------------
-            // Stream data rows — dataProvider calls rowWriter once per record
-            // ----------------------------------------------------------------
-            AtomicInteger rowNum = new AtomicInteger(1);
+            final SXSSFSheet[] cur       = { openSheet(workbook, baseName, 1, config,
+                                                        colCount, columns, headerStyle, colStyles) };
+            final int[]        rowInSheet = { 1 };   // next row index inside cur[0] (0 = header)
+            final int[]        sheetNum   = { 1 };
+            final int[]        totalRows  = { 0 };
 
             dataProvider.fetchData(rowData -> {
-                Row row = sheet.createRow(rowNum.getAndIncrement());
+
+                // Roll to a new sheet when the current one is full
+                if (rowInSheet[0] > maxPerSheet) {
+                    applyColumnWidths(cur[0], columns);   // finalise widths on completed sheet
+                    sheetNum[0]++;
+                    cur[0]       = openSheet(workbook, baseName, sheetNum[0], config,
+                                             colCount, columns, headerStyle, colStyles);
+                    rowInSheet[0] = 1;
+                }
+
+                Row row = cur[0].createRow(rowInSheet[0]++);
                 for (int i = 0; i < colCount; i++) {
                     ExcelColumnConfig colCfg = columns.get(i);
                     Cell cell = row.createCell(i);
                     cell.setCellStyle(colStyles.get(i));
                     setCellValue(cell, rowData.get(colCfg.getFieldName()), colCfg.getDataType());
                 }
+                totalRows[0]++;
             });
 
-            int dataRows = rowNum.get() - 1;
-            log.info("Excel export — {} data rows written, setting column widths", dataRows);
+            // Finalise the last (or only) sheet
+            applyColumnWidths(cur[0], columns);
 
-            // ----------------------------------------------------------------
-            // Column widths — must be set AFTER rows are written when estimating,
-            // but since SXSSF flushes rows we use a static estimate rather than
-            // autoSizeColumn (which only works for rows still in the window).
-            // ----------------------------------------------------------------
-            for (int i = 0; i < colCount; i++) {
-                ExcelColumnConfig col = columns.get(i);
-                int width = col.getWidthChars() > 0
-                        ? col.getWidthChars() * 256
-                        : estimateWidth(col);
-                sheet.setColumnWidth(i, Math.min(width, 255 * 256)); // POI max = 255 chars
-            }
+            log.info("Excel export — {} data rows written across {} sheet(s), flushing workbook",
+                    totalRows[0], sheetNum[0]);
 
             workbook.write(outputStream);
             outputStream.flush();
-            // workbook.close() calls dispose() which deletes the SXSSF temp files
         }
 
         log.info("Excel export complete");
+    }
+
+    // -----------------------------------------------------------------------
+    // Sheet initialisation helper — used for both first sheet and continuations
+    // -----------------------------------------------------------------------
+
+    private SXSSFSheet openSheet(SXSSFWorkbook workbook,
+                                  String baseName,
+                                  int sheetNumber,
+                                  ExcelExportConfig config,
+                                  int colCount,
+                                  List<ExcelColumnConfig> columns,
+                                  CellStyle headerStyle,
+                                  Map<Integer, CellStyle> colStyles) {
+
+        String name = sheetNumber == 1 ? baseName : baseName + " (" + sheetNumber + ")";
+        SXSSFSheet sheet = workbook.createSheet(name);
+        sheet.setDefaultRowHeightInPoints(15);
+
+        // Header row
+        Row headerRow = sheet.createRow(0);
+        headerRow.setHeightInPoints(22);
+        for (int i = 0; i < colCount; i++) {
+            Cell cell = headerRow.createCell(i);
+            cell.setCellValue(columns.get(i).getHeader());
+            cell.setCellStyle(headerStyle);
+        }
+
+        // Freeze pane
+        int freezeCols = Math.max(config.getFreezeColumnCount(), 0);
+        int freezeRows = config.getFreezeRowCount() > 0 ? config.getFreezeRowCount() : 1;
+        sheet.createFreezePane(freezeCols, freezeRows);
+
+        // Auto-filter
+        sheet.setAutoFilter(new CellRangeAddress(0, 0, 0, colCount - 1));
+
+        return sheet;
+    }
+
+    // -----------------------------------------------------------------------
+    // Apply column widths — called once per sheet after its rows are written
+    // -----------------------------------------------------------------------
+
+    private void applyColumnWidths(SXSSFSheet sheet, List<ExcelColumnConfig> columns) {
+        for (int i = 0; i < columns.size(); i++) {
+            ExcelColumnConfig col = columns.get(i);
+            int width = col.getWidthChars() > 0
+                    ? col.getWidthChars() * 256
+                    : estimateWidth(col);
+            sheet.setColumnWidth(i, Math.min(width, 255 * 256));
+        }
     }
 
     // -----------------------------------------------------------------------
